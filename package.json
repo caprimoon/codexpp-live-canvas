@@ -1,0 +1,14 @@
+{
+  "name": "codexpp-live-canvas",
+  "version": "1.0.0",
+  "private": true,
+  "description": "LiveCanvas · 动态壁纸与毛玻璃 — Live wallpaper and adjustable glassmorphism extension for Codex++",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "check": "node scripts/check.mjs",
+    "test": "node --test tests/backend.test.mjs tests/frontend.test.mjs"
+  }
+}

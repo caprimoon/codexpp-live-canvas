@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <defs>
+    <linearGradient id="lc-bg" x1="16" y1="12" x2="112" y2="116" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1e1b38"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+    <linearGradient id="lc-sky" x1="20" y1="22" x2="108" y2="96" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0ea5e9" stop-opacity=".42"/>
+      <stop offset="52%" stop-color="#6366f1" stop-opacity=".34"/>
+      <stop offset="100%" stop-color="#a855f7" stop-opacity=".28"/>
+    </linearGradient>
+    <linearGradient id="lc-orb" x1="82" y1="32" x2="82" y2="60" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#fde047"/>
+      <stop offset="100%" stop-color="#f97316"/>
+    </linearGradient>
+    <linearGradient id="lc-ridge-back" x1="24" y1="54" x2="104" y2="102" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity=".65"/>
+      <stop offset="100%" stop-color="#3b82f6" stop-opacity=".35"/>
+    </linearGradient>
+    <linearGradient id="lc-ridge-front" x1="22" y1="68" x2="106" y2="104" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1e293b"/>
+      <stop offset="100%" stop-color="#0b1220"/>
+    </linearGradient>
+    <clipPath id="lc-frame">
+      <rect x="20" y="24" width="88" height="80" rx="18"/>
+    </clipPath>
+  </defs>
+  <rect x="6" y="6" width="116" height="116" rx="28" fill="url(#lc-bg)" stroke="#334155" stroke-width="2.5"/>
+  <g clip-path="url(#lc-frame)">
+    <rect x="20" y="24" width="88" height="80" fill="url(#lc-sky)"/>
+    <circle cx="84" cy="46" r="14" fill="url(#lc-orb)" opacity=".22"/>
+    <circle cx="84" cy="46" r="8.5" fill="url(#lc-orb)"/>
+    <path d="M20 79 47 55l17 14 19-16 25 22v29H20V79Z" fill="url(#lc-ridge-back)"/>
+    <path d="M20 88 44 68l21 15 16-11 27 21v11H20V88Z" fill="url(#lc-ridge-front)"/>
+    <rect x="26" y="81" width="76" height="17" rx="8.5" fill="#ffffff" fill-opacity=".14" stroke="#ffffff" stroke-opacity=".28" stroke-width="1.2"/>
+    <circle cx="38" cy="89.5" r="3" fill="#38bdf8"/>
+    <rect x="46" y="87.5" width="32" height="4" rx="2" fill="#e2e8f0" fill-opacity=".75"/>
+    <circle cx="91" cy="89.5" r="5" fill="#a855f7" fill-opacity=".85"/>
+  </g>
+  <rect x="20" y="24" width="88" height="80" rx="18" stroke="#94a3b8" stroke-opacity=".35" stroke-width="1.8"/>
+  <circle cx="52" cy="54" r="13" fill="#0f172a" fill-opacity=".62" stroke="#e2e8f0" stroke-opacity=".55" stroke-width="1.6"/>
+  <path d="M48.5 48.2 58.5 54l-10 5.8V48.2Z" fill="#f8fafc"/>
+</svg>

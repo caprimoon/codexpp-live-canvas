@@ -1,0 +1,31 @@
+{
+  "id": "live-wallpaper-studio",
+  "name": "LiveCanvas · 动态壁纸与毛玻璃",
+  "version": "1.0.0",
+  "author": "caprimoon",
+  "license": "MIT",
+  "repository": "https://github.com/caprimoon/codexpp-live-canvas",
+  "homepage": "https://github.com/caprimoon/codexpp-live-canvas",
+  "description": "为 Codex++ 打造沉浸式动态壁纸与三区独立毛玻璃界面：聚合五大在线高清片源并支持本地视频/图片导入，内置低负载实时动画，支持左侧栏/对话区/输入框颜色、0%–100% 遮罩、毛玻璃虚化及最短边无黑边铺满。",
+  "icon": "assets/icon.svg",
+  "keywords": [
+    "codex",
+    "wallpaper",
+    "live-wallpaper",
+    "glassmorphism",
+    "video",
+    "canvas"
+  ],
+  "engines": {
+    "codexpp": 1
+  },
+  "renderer": [
+    "renderer.js"
+  ],
+  "permissions": {
+    "routes": []
+  },
+  "backend": {
+    "script": "backend/main.mjs"
+  }
+}
