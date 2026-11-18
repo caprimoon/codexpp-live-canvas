@@ -185,6 +185,7 @@ function loadRenderer({ storedSettings = {}, getComputedStyle } = {}) {
     shortcuts: [],
     configHandlers: [],
     scanHandlers: [],
+    eventHandlers: new Map(),
     effects: [],
   };
   const storageMap = new Map();
@@ -204,6 +205,15 @@ function loadRenderer({ storedSettings = {}, getComputedStyle } = {}) {
     },
     effect(fn) { registrations.effects.push(fn()); },
     onScan(fn) { registrations.scanHandlers.push(fn); },
+    on(evt, fn) {
+      const list = registrations.eventHandlers.get(evt) || [];
+      list.push(fn);
+      registrations.eventHandlers.set(evt, list);
+      return () => {
+        const cur = registrations.eventHandlers.get(evt);
+        if (cur) registrations.eventHandlers.set(evt, cur.filter(f => f !== fn));
+      };
+    },
     listen(target, type, fn, opts) { target.addEventListener?.(type, fn, opts); },
     setInterval() { return () => {}; },
     setTimeout() { return () => {}; },
@@ -219,10 +229,25 @@ function loadRenderer({ storedSettings = {}, getComputedStyle } = {}) {
   };
 
   class ElementMock {}
+  const winListeners = new Map();
+  const windowObj = {
+    addEventListener(type, fn) {
+      const list = winListeners.get(type) || [];
+      list.push(fn);
+      winListeners.set(type, list);
+    },
+    removeEventListener(type, fn) {
+      const list = winListeners.get(type);
+      if (list) winListeners.set(type, list.filter(f => f !== fn));
+    },
+    dispatchEvent(ev) {
+      for (const fn of winListeners.get(ev.type) || []) fn(ev);
+    },
+  };
   const sandbox = {
     document,
     Element: ElementMock,
-    window: {},
+    window: windowObj,
     innerWidth: 1380,
     innerHeight: 880,
     devicePixelRatio: 1,
@@ -241,7 +266,7 @@ function loadRenderer({ storedSettings = {}, getComputedStyle } = {}) {
     }
   };
   vm.runInNewContext(read('renderer.js'), sandbox, { filename: 'renderer.js' });
-  return { document, makeNode, dispatchDocClick, registrations, ctx, storageMap, ElementMock };
+  return { document, window: windowObj, makeNode, dispatchDocClick, registrations, ctx, storageMap, ElementMock };
 }
 
 test('manifest keeps configuration unified inside extension with branded name, description, and icon', () => {
@@ -347,7 +372,7 @@ test('unified 显示设置 tab inside 1/3 drawer renders sliders, descriptions, 
   assert.equal(colorInputs.length, 3);
   assert.equal(textInputs.length, 0);
   const descs = settingsContainer.querySelectorAll('.lws-settings-desc');
-  assert.equal(descs.length, 22);
+  assert.equal(descs.length, 23);
   for (const d of descs) assert(d.textContent.length > 8);
   assert.equal(colorInputs.find(i => i.dataset.setting === 'color1').value, '#232323');
   assert.equal(colorInputs.find(i => i.dataset.setting === 'color2').value, '#232323');
@@ -622,4 +647,190 @@ test('color pickers (default #232323/#232323/#4a4a4a) and splitPanels switch cus
   assert.equal(c1.value, '#232323');
   assert.equal(c2.value, '#232323');
   assert.equal(c3.value, '#4a4a4a');
+});
+
+test('pauseOnTask pauses live wallpaper during active turn and resumes after completion or toggle off', () => {
+  const { document, makeNode, registrations, storageMap } = loadRenderer();
+  const layer = document.querySelector('#lws-background');
+  const composer = makeNode('div');
+  composer.setAttribute('data-composer-surface-variant', 'default');
+  document.body.append(composer);
+  registrations.scanHandlers[0]();
+
+  assert.equal(layer.dataset.playback, '内置动态场景 · 低负载');
+  for (const fn of registrations.eventHandlers.get('codex/turn/started') || []) {
+    fn({ threadId: 'thr-1', turn: { id: 'turn-1' } });
+  }
+  assert.equal(layer.dataset.playback, '任务运行中，已暂停动态壁纸');
+  // Glassmorphism remains active even while live playback is paused during a task.
+  assert.equal(composer.style.getPropertyValue('backdrop-filter'), 'blur(12px)');
+
+  for (const fn of registrations.eventHandlers.get('codex/turn/completed') || []) {
+    fn({ threadId: 'thr-1', turn: { id: 'turn-1' } });
+  }
+  assert.equal(layer.dataset.playback, '内置动态场景 · 低负载');
+
+  // Re-trigger active turn then disable pauseOnTask switch in settings drawer.
+  for (const fn of registrations.eventHandlers.get('codex/turn/started') || []) {
+    fn({ threadId: 'thr-2', turn: { id: 'turn-2' } });
+  }
+  assert.equal(layer.dataset.playback, '任务运行中，已暂停动态壁纸');
+
+  registrations.navEntries[0].onActivate();
+  const drawer = document.querySelector('#lws-drawer');
+  const pauseOnTaskToggle = drawer.querySelectorAll('[data-setting="pauseOnTask"]').find(n => n.getAttribute('role') === 'switch');
+  assert(pauseOnTaskToggle);
+  assert.equal(pauseOnTaskToggle.getAttribute('aria-checked'), 'true');
+  pauseOnTaskToggle.onclick();
+
+  assert.equal(storageMap.get('settings').pauseOnTask, false);
+  assert.equal(pauseOnTaskToggle.getAttribute('aria-checked'), 'false');
+  assert.equal(layer.dataset.playback, '内置动态场景 · 低负载');
+});
+
+test('scanTopChrome skips deep thread subtrees and respects disabled wallpaper early exit', () => {
+  const styles = new Map();
+  const baseStyle = (overrides = {}) => ({
+    backgroundColor: 'rgba(0, 0, 0, 0)',
+    backgroundImage: 'none',
+    boxShadow: 'none',
+    backdropFilter: 'none',
+    webkitBackdropFilter: 'none',
+    borderTopWidth: '0px',
+    borderTopColor: 'rgba(0, 0, 0, 0)',
+    borderBottomWidth: '0px',
+    borderBottomColor: 'rgba(0, 0, 0, 0)',
+    borderRadius: '0px',
+    height: 'auto',
+    content: 'none',
+    ...overrides,
+  });
+  const getComputedStyle = (el, pseudo = '') => styles.get((el._key || el.tagName) + ':' + pseudo) || baseStyle();
+  const { document, makeNode, registrations } = loadRenderer({ getComputedStyle });
+
+  const main = makeNode('main');
+  main.setAttribute('data-app-shell-main-surface', 'true');
+  main.getBoundingClientRect = () => ({ top: 32, left: 240, width: 1000, height: 800, bottom: 832 });
+
+  const thread = makeNode('div');
+  thread.setAttribute('data-ds-part', 'thread');
+  thread.getBoundingClientRect = () => ({ top: 32, left: 240, width: 1000, height: 760, bottom: 792 });
+
+  let threadChildRectCalls = 0;
+  const threadBanner = makeNode('div');
+  threadBanner._key = 'threadBanner';
+  threadBanner.getBoundingClientRect = () => {
+    threadChildRectCalls += 1;
+    return { top: 36, left: 240, width: 900, height: 40, bottom: 76 };
+  };
+  styles.set('threadBanner:', baseStyle({ backgroundColor: 'rgb(20, 20, 20)' }));
+
+  thread.append(threadBanner);
+  main.append(thread);
+  document.body.append(main);
+
+  registrations.scanHandlers[0]();
+  assert.equal(threadChildRectCalls, 0);
+  assert.equal(threadBanner.hasAttribute('data-lws-top-clear'), false);
+
+  // Disabling wallpaper restores overrides and prevents onScan from re-applying glass.
+  const assistant = makeNode('div');
+  assistant.setAttribute('data-local-conversation-final-assistant', 'true');
+  document.body.append(assistant);
+  registrations.navEntries[0].onActivate();
+  const drawer = document.querySelector('#lws-drawer');
+  drawer.querySelectorAll('button').find(b => b.textContent === '关闭壁纸').onclick();
+  assert.equal(assistant.style.getPropertyValue('backdrop-filter'), '');
+});
+
+test('pauseOnTask detects running tasks via composer Stop/Queue button, sidebar spinner, agent/status, and mcp-notification', () => {
+  const { document, window, makeNode, registrations } = loadRenderer();
+  const layer = document.querySelector('#lws-background');
+
+  const composerRoot = makeNode('div');
+  composerRoot.setAttribute('data-codex-composer-root', 'true');
+  const actionBtn = makeNode('button');
+  actionBtn.className = 'bg-composer-primary';
+  actionBtn.setAttribute('aria-label', '开启语音聊天');
+  composerRoot.append(actionBtn);
+
+  const sidebar = makeNode('aside');
+  sidebar.setAttribute('data-app-shell-left-panel-appearance', 'true');
+  const threadRow = makeNode('div');
+  threadRow.setAttribute('data-app-action-sidebar-thread-id', 'thr-bg');
+  sidebar.append(threadRow);
+  document.body.append(sidebar, composerRoot);
+
+  registrations.scanHandlers[0]();
+  assert.equal(layer.dataset.playback, '内置动态场景 · 低负载');
+
+  // 1. Composer button flips to Chinese "停止" -> pauses immediately.
+  actionBtn.setAttribute('aria-label', '停止');
+  registrations.scanHandlers[0]();
+  assert.equal(layer.dataset.playback, '任务运行中，已暂停动态壁纸');
+
+  // 2. Manual "播放" mid-task resumes current turn cleanly, then idle resets override for the next task.
+  registrations.navEntries[0].onActivate();
+  const drawer = document.querySelector('#lws-drawer');
+  const playBtn = drawer.querySelectorAll('button').find(b => b.dataset.action === 'playback');
+  assert.equal(playBtn.textContent, '播放');
+  playBtn.onclick();
+  assert.equal(layer.dataset.playback, '内置动态场景 · 低负载');
+
+  actionBtn.setAttribute('aria-label', '开启语音聊天');
+  registrations.scanHandlers[0]();
+  assert.equal(layer.dataset.playback, '内置动态场景 · 低负载');
+
+  // Next task with lone square <rect> icon and no stop aria-label pauses again.
+  actionBtn.setAttribute('aria-label', '');
+  const svg = makeNode('svg');
+  const rect = makeNode('rect');
+  svg.append(rect);
+  actionBtn.append(svg);
+  registrations.scanHandlers[0]();
+  assert.equal(layer.dataset.playback, '任务运行中，已暂停动态壁纸');
+
+  // Back to idle via Send button.
+  actionBtn.replaceChildren();
+  actionBtn.setAttribute('aria-label', '发送');
+  registrations.scanHandlers[0]();
+  assert.equal(layer.dataset.playback, '内置动态场景 · 低负载');
+
+  // 3. Background thread spinner in sidebar pauses even when current composer is idle.
+  const spin = makeNode('span');
+  spin.className = 'animate-spin';
+  threadRow.append(spin);
+  registrations.scanHandlers[0]();
+  assert.equal(layer.dataset.playback, '任务运行中，已暂停动态壁纸');
+  spin.remove();
+  registrations.scanHandlers[0]();
+  assert.equal(layer.dataset.playback, '内置动态场景 · 低负载');
+
+  // 4. Codex++ agent/status (for Codex 26.1111+ where codex/turn/started dispatcher is absent).
+  assert.equal(registrations.eventHandlers.get('agent/status')?.length, 1);
+  for (const fn of registrations.eventHandlers.get('agent/status')) fn({ sessionId: 'sess-1', status: 'running' });
+  assert.equal(layer.dataset.playback, '任务运行中，已暂停动态壁纸');
+  for (const fn of registrations.eventHandlers.get('agent/status')) fn({ sessionId: 'sess-1', status: 'idle' });
+  assert.equal(layer.dataset.playback, '内置动态场景 · 低负载');
+
+  // 5. Electron native window mcp-notification channel.
+  window.dispatchEvent({
+    type: 'message',
+    source: null,
+    origin: '',
+    data: { type: 'mcp-notification', hostId: 'local', message: { method: 'turn/started', params: { threadId: 'thr-msg' } } },
+  });
+  assert.equal(layer.dataset.playback, '任务运行中，已暂停动态壁纸');
+  window.dispatchEvent({
+    type: 'message',
+    source: null,
+    origin: '',
+    data: { type: 'mcp-notification', hostId: 'local', message: { method: 'turn/completed', params: { threadId: 'thr-msg' } } },
+  });
+  assert.equal(layer.dataset.playback, '内置动态场景 · 低负载');
+
+  // 6. Disabling pauseOnTask switch unsubscribes agent/status watcher cleanly.
+  const pauseOnTaskToggle = drawer.querySelectorAll('[data-setting="pauseOnTask"]').find(n => n.getAttribute('role') === 'switch');
+  pauseOnTaskToggle.onclick();
+  assert.equal(registrations.eventHandlers.get('agent/status')?.length, 0);
 });

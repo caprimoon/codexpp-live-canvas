@@ -188,6 +188,11 @@ codexPlus.extension((ctx) => {
       description: '切换至其他应用或最小化 Codex 时自动暂停动态壁纸与动画渲染，切回时自动恢复播放，降低后台 CPU/GPU 占用。'
     },
     {
+      key: 'pauseOnTask', type: 'boolean', default: true,
+      title: '任务运行中暂停动态壁纸',
+      description: 'Codex 生成回复或执行工具期间自动暂停动态壁纸并保留毛玻璃效果，任务完成后自动恢复播放，减少高负载卡顿。'
+    },
+    {
       key: 'respectMotion', type: 'boolean', default: true,
       title: '尊重系统减少动态效果',
       description: '开启后，当系统启用了“减弱动态效果”时壁纸默认保持静止；点击上方“仍然播放”或手动应用壁纸后可恢复动画。'
@@ -202,7 +207,7 @@ codexPlus.extension((ctx) => {
     color2: '#232323', glass2: 50, glassBlur2: 12,
     color3: '#4a4a4a', glass3: 50, glassBlur3: 12,
     fit: 'cover', quality: 'auto', focalX: 50, focalY: 50, speed: 1,
-    paused: false, pauseHidden: true, respectMotion: true, motionConsent: false, interval: 0
+    paused: false, pauseHidden: true, pauseOnTask: true, respectMotion: true, motionConsent: false, interval: 0
   };
   function normalizeFieldValue(field, raw) {
     if (field.type === 'range') {
@@ -249,7 +254,19 @@ codexPlus.extension((ctx) => {
   let drawerOpen = false, drawerEl = null, drawerCleanup = null;
   const marked = new Set(), glassOverrides = new Map();
   const topClearNodes = new Set(), pseudoClearNodes = new Set(), shadowClearNodes = new Set();
-  let topScanQueued = 0;
+  const activeTaskTurns = new Map();
+  const TASK_STALE_MS = 180_000;
+  const COMPOSER_ROOT_SELECTOR = '[data-codex-composer-root],[data-composer-surface-variant],.composer-surface-chrome,[data-composer-surface-overflow]';
+  const SIDEBAR_SPINNER_SELECTOR = '.animate-spin,[class*="animate-spin"],[role="progressbar"],[aria-busy="true"]';
+  const TASK_BUTTON_LABEL_RE = /(?:^|[\s(（])(?:停止|中断|终止|取消生成|排队)|\b(?:stop|interrupt|abort|queue)\b|stop[-_]?(?:button|generating)/i;
+  const TASK_IGNORE_LABEL_RE = /语音|voice|dictat|mic|listen/i;
+  let domTaskRunning = false, manualTaskPlayOverride = false;
+  let cachedComposerRoots = [], cachedComposerRootsAt = 0, cachedSidebarRoot = null;
+  let composerTaskObserver = null, observedComposerNode = null;
+  let topScanQueued = 0, topScanTimer = 0, lastTopScanAt = 0;
+  let scanCooldownTimer = 0, lastScanAt = 0;
+  let cachedOwnRailNodes = null, cachedMainRoots = [], cachedMainRootsAt = 0;
+  let taskUnsubscribers = [], agentStatusUnsubscribe = null, taskPruneStop = null;
   const thumbPromises = new Map(); let thumbnailQueue = [], thumbnailWorkers = 0, playbackRevision = 0;
   const thumbnailObserver = new IntersectionObserver(entries => {
     for (const entry of entries) if (entry.isIntersecting) {
@@ -272,19 +289,38 @@ codexPlus.extension((ctx) => {
   const storeSettings = () => ctx.storage.set('settings', settings);
   const storeList = () => { ctx.storage.set('favorites', favorites); ctx.storage.set('locals', locals); };
   const notify = () => { if (layer) { layer.dataset.playback = playback; layer.dataset.wallpaper = current?.title || '未选择'; layer.dataset.busy = String(busy); } for (const fn of [...uiListeners]) fn(); };
+  function pruneStaleTaskTurns(now = Date.now()) {
+    let changed = false;
+    for (const [id, ts] of activeTaskTurns) {
+      if (now - ts > TASK_STALE_MS) {
+        activeTaskTurns.delete(id);
+        changed = true;
+      }
+    }
+    return changed;
+  }
   const reduced = () => settings.respectMotion && motionQuery.matches && !settings.motionConsent;
-  const shouldPause = () => settings.paused || !settings.enabled || (settings.pauseHidden && document.hidden) || reduced();
-  function saveSettings() { storeSettings(); applyAppearance(); syncPlayback(); notify(); }
+  const hasActiveTask = () => domTaskRunning || activeTaskTurns.size > 0;
+  const isTaskPaused = () => !!(settings.pauseOnTask && hasActiveTask() && !manualTaskPlayOverride);
+  const shouldPause = () => settings.paused || !settings.enabled || (settings.pauseHidden && document.hidden) || reduced() || isTaskPaused();
+  const pausedStatusText = () => reduced() ? '已按系统“减少动态效果”暂停' : !settings.enabled ? '壁纸已关闭' : isTaskPaused() ? '任务运行中，已暂停动态壁纸' : '已暂停';
+  function saveSettings() { storeSettings(); syncAgentStatusSubscription(); applyAppearance(); syncDomTaskState(); syncPlayback(); notify(); }
   const button = (label, fn, cls = '') => { const b = $('button', 'lws-btn ' + cls, label); b.type = 'button'; b.onclick = fn; return b; };
   function stateLine(message, error = false) { playback = message; lastError = error ? message : ''; notify(); }
 
   function syncOwnRailActive(active) {
-    for (const node of document.querySelectorAll('[data-codex-plus-ext-rail][data-codex-plus-ext*="live-wallpaper-studio"]')) {
-      if (active) node.setAttribute('data-codex-plus-ext-rail-active', 'true');
-      else node.removeAttribute('data-codex-plus-ext-rail-active');
+    if (!cachedOwnRailNodes?.length || cachedOwnRailNodes.some(n => !n.isConnected)) {
+      cachedOwnRailNodes = [...document.querySelectorAll('[data-codex-plus-ext-rail][data-codex-plus-ext*="live-wallpaper-studio"]')];
+    }
+    for (const node of cachedOwnRailNodes) {
+      const hadAttr = node.hasAttribute('data-codex-plus-ext-rail-active');
+      if (active && !hadAttr) node.setAttribute('data-codex-plus-ext-rail-active', 'true');
+      else if (!active && hadAttr) node.removeAttribute('data-codex-plus-ext-rail-active');
       const btn = node.querySelector('button') || node;
       if (!btn) continue;
-      btn.dataset.active = active ? 'true' : 'false';
+      const expected = active ? 'true' : 'false';
+      if (btn.dataset.active === expected && btn.hasAttribute('aria-current') === active) continue;
+      btn.dataset.active = expected;
       if (active) {
         btn.setAttribute('data-selected', '');
         btn.setAttribute('aria-current', 'page');
@@ -386,26 +422,26 @@ codexPlus.extension((ctx) => {
       html[data-live-wallpaper="on"] [data-app-shell-pane-frame]::before,html[data-live-wallpaper="on"] [data-app-shell-pane-frame]::after,
       html[data-live-wallpaper="on"] [data-app-shell-main-content-layout]::before,html[data-live-wallpaper="on"] [data-app-shell-main-content-layout]::after,
       html[data-live-wallpaper="on"] [data-app-shell-main-content-top-fade]::before,html[data-live-wallpaper="on"] [data-app-shell-main-content-top-fade]::after{background:transparent!important;background-color:transparent!important;background-image:none!important;box-shadow:none!important}
-      html[data-live-wallpaper="on"] :is([data-app-shell-main-surface],[data-app-shell-focus-area="main"]) :is(.app-shell-main-content-top-fade,[data-app-shell-main-content-top-fade]:not(:has(*)),[class*="_MainContentTopFade_"]){display:none!important;background:transparent!important;background-image:none!important}
+      html[data-live-wallpaper="on"] :is([data-app-shell-main-surface],[data-app-shell-focus-area="main"]) :is(.app-shell-main-content-top-fade,[data-app-shell-main-content-top-fade]:empty,[class*="_MainContentTopFade_"]){display:none!important;background:transparent!important;background-image:none!important}
       html[data-live-wallpaper="on"] :is([data-app-shell-main-surface],[data-app-shell-focus-area="main"]) .app-shell-main-content-frame{border-top:0!important;box-shadow:none!important}
       html[data-live-wallpaper="on"] [data-app-shell-main-surface] > header,
       html[data-live-wallpaper="on"] [data-app-shell-focus-area="main"] > header,
-      html[data-live-wallpaper="on"] :is([data-app-shell-main-surface],[data-app-shell-focus-area="main"]) :is(header.app-header-tint,header[data-app-shell-header-edge-scroll],header[class*="_Header_"],[data-app-shell-header-layout],[data-app-shell-header-edge-scroll],.sticky:not(:has([data-ds-part="composer"],[data-codex-composer-root])),[data-sticky]:not(:has([data-ds-part="composer"],[data-codex-composer-root]))),
+      html[data-live-wallpaper="on"] :is([data-app-shell-main-surface],[data-app-shell-focus-area="main"]) :is(header.app-header-tint,header[data-app-shell-header-edge-scroll],header[class*="_Header_"],[data-app-shell-header-layout],[data-app-shell-header-edge-scroll],.sticky:not([data-ds-part="composer"],[data-codex-composer-root],[data-composer-surface-variant],.composer-surface-chrome),[data-sticky]:not([data-ds-part="composer"],[data-codex-composer-root],[data-composer-surface-variant],.composer-surface-chrome)),
       html[data-live-wallpaper="on"] [data-app-shell-focus-area] > .bg-surface,
       html[data-live-wallpaper="on"] [data-app-shell-pane-frame] > .bg-surface,
-      html[data-live-wallpaper="on"] :is([data-app-shell-main-surface],[data-app-shell-focus-area="main"]) :is([class*="bg-linear-to-b"],[class*="bg-gradient-to-b"]):not(:has(button,a,input,textarea)),
-      html[data-live-wallpaper="on"] :is([data-app-shell-main-surface],[data-app-shell-focus-area="main"]) .pointer-events-none:is([aria-hidden="true"],[class*="top-0"],[class*="-top-"],[style*="linear-gradient"]):not(svg,img,button,:has(button,a,input,textarea),[data-local-conversation-final-assistant],[data-local-conversation-final-assistant] *,[data-user-message-bubble],[data-user-message-bubble] *){background:transparent!important;background-color:transparent!important;background-image:none!important;box-shadow:none!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important;border-bottom:0!important}
+      html[data-live-wallpaper="on"] :is([data-app-shell-main-surface],[data-app-shell-focus-area="main"]) :is([class*="bg-linear-to-b"]:empty,[class*="bg-gradient-to-b"]:empty),
+      html[data-live-wallpaper="on"] :is([data-app-shell-main-surface],[data-app-shell-focus-area="main"]) .pointer-events-none:is([aria-hidden="true"],[class*="top-0"],[class*="-top-"],[style*="linear-gradient"]):empty{background:transparent!important;background-color:transparent!important;background-image:none!important;box-shadow:none!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important;border-bottom:0!important}
       @layer theme{
         html[data-live-wallpaper="on"] :is([data-app-shell-main-surface],[data-app-shell-focus-area="main"],[data-app-shell-main-content-layout],[data-app-shell-main-content-top-fade],[data-ds-part="thread"],.thread-scroll-container,[data-app-action-timeline-scroll]){background:transparent!important;background-color:transparent!important;background-image:none!important;box-shadow:none!important}
         html[data-live-wallpaper="on"] [data-app-shell-main-surface] > header,
         html[data-live-wallpaper="on"] [data-app-shell-focus-area="main"] > header,
-        html[data-live-wallpaper="on"] :is([data-app-shell-main-surface],[data-app-shell-focus-area="main"]) :is(header.app-header-tint,header[data-app-shell-header-edge-scroll],header[class*="_Header_"],[data-app-shell-header-layout],[data-app-shell-header-edge-scroll],.sticky:not(:has([data-ds-part="composer"],[data-codex-composer-root])),[data-sticky]:not(:has([data-ds-part="composer"],[data-codex-composer-root])),.app-shell-main-content-frame):not([data-ds-part="composer"],[data-ds-part="composer"] *,[data-codex-composer-root],[data-codex-composer-root] *,[role="dialog"],[role="dialog"] *,[role="menu"],[role="menu"] *,[data-slot="popover-content"],[data-slot="popover-content"] *){background:transparent!important;background-color:transparent!important;background-image:none!important;box-shadow:none!important;border-top:0!important;border-bottom:0!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
-        html[data-live-wallpaper="on"] :is([data-app-shell-main-surface],[data-app-shell-focus-area="main"]) :is([data-app-shell-page-surface="true"],[data-app-shell-pane-frame],[data-app-shell-focus-area] > .bg-surface,[data-app-shell-pane-frame] > .bg-surface,[class~="bg-token-main-surface-primary"][class~="h-full"][class~="w-full"],[class~="h-full"][class~="electron:bg-surface"],.app-shell-main-content-top-fade,[class*="_MainContentTopFade_"],[class*="_topFade_"],[class*="_TopFade_"],[class*="_scrollFade_"],[class*="_ScrollFade_"],[class*="bg-linear-to-b"]:not(:has(button,a,input,textarea)),[class*="bg-gradient-to-b"]:not(:has(button,a,input,textarea)),.pointer-events-none:is([aria-hidden="true"],[class*="top-0"],[class*="-top-"],[class*="to-transparent"],[style*="linear-gradient"]):not(:has(button,a,input,textarea))):not([data-ds-part="composer"],[data-ds-part="composer"] *,[data-codex-composer-root],[data-codex-composer-root] *,[role="dialog"],[role="dialog"] *,[role="menu"],[role="menu"] *,[data-slot="popover-content"],[data-slot="popover-content"] *,[data-local-conversation-final-assistant],[data-local-conversation-final-assistant] *,[data-user-message-bubble],[data-user-message-bubble] *,button,button *,svg,img){background:transparent!important;background-color:transparent!important;background-image:none!important;box-shadow:none!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
+        html[data-live-wallpaper="on"] :is([data-app-shell-main-surface],[data-app-shell-focus-area="main"]) :is(header.app-header-tint,header[data-app-shell-header-edge-scroll],header[class*="_Header_"],[data-app-shell-header-layout],[data-app-shell-header-edge-scroll],.sticky:not([data-ds-part="composer"],[data-codex-composer-root],[data-composer-surface-variant],.composer-surface-chrome),[data-sticky]:not([data-ds-part="composer"],[data-codex-composer-root],[data-composer-surface-variant],.composer-surface-chrome),.app-shell-main-content-frame):not([data-ds-part="composer"],[data-ds-part="composer"] *,[data-codex-composer-root],[data-codex-composer-root] *,[role="dialog"],[role="dialog"] *,[role="menu"],[role="menu"] *,[data-slot="popover-content"],[data-slot="popover-content"] *){background:transparent!important;background-color:transparent!important;background-image:none!important;box-shadow:none!important;border-top:0!important;border-bottom:0!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
+        html[data-live-wallpaper="on"] :is([data-app-shell-main-surface],[data-app-shell-focus-area="main"]) :is([data-app-shell-page-surface="true"],[data-app-shell-pane-frame],[data-app-shell-focus-area] > .bg-surface,[data-app-shell-pane-frame] > .bg-surface,[class~="bg-token-main-surface-primary"][class~="h-full"][class~="w-full"],[class~="h-full"][class~="electron:bg-surface"],.app-shell-main-content-top-fade,[class*="_MainContentTopFade_"],[class*="_topFade_"],[class*="_TopFade_"],[class*="_scrollFade_"],[class*="_ScrollFade_"],[class*="bg-linear-to-b"]:empty,[class*="bg-gradient-to-b"]:empty,.pointer-events-none:is([aria-hidden="true"],[class*="top-0"],[class*="-top-"],[class*="to-transparent"],[style*="linear-gradient"]):empty):not([data-ds-part="composer"],[data-ds-part="composer"] *,[data-codex-composer-root],[data-codex-composer-root] *,[role="dialog"],[role="dialog"] *,[role="menu"],[role="menu"] *,[data-slot="popover-content"],[data-slot="popover-content"] *,[data-local-conversation-final-assistant],[data-local-conversation-final-assistant] *,[data-user-message-bubble],[data-user-message-bubble] *,button,button *,svg,img){background:transparent!important;background-color:transparent!important;background-image:none!important;box-shadow:none!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
         html[data-live-wallpaper="on"] :is([data-app-shell-main-surface],[data-app-shell-focus-area="main"],[data-app-shell-page-surface="true"],[data-app-shell-pane-frame],[data-app-shell-main-content-layout],[data-app-shell-main-content-top-fade])::before,
         html[data-live-wallpaper="on"] :is([data-app-shell-main-surface],[data-app-shell-focus-area="main"],[data-app-shell-page-surface="true"],[data-app-shell-pane-frame],[data-app-shell-main-content-layout],[data-app-shell-main-content-top-fade])::after,
-        html[data-live-wallpaper="on"] :is([data-app-shell-main-surface],[data-app-shell-focus-area="main"]) :is(header,.app-header-tint,[class*="_Header_"],[data-app-shell-page-surface="true"],[data-app-shell-pane-frame],[data-app-shell-main-content-layout],[data-app-shell-main-content-top-fade],[data-app-shell-header-layout],[data-app-shell-header-edge-scroll],.sticky:not(:has([data-ds-part="composer"],[data-codex-composer-root])),[data-sticky]:not(:has([data-ds-part="composer"],[data-codex-composer-root])),[class*="after:bg-linear-to-"],[class*="after:bg-gradient-to-"],[class*="before:bg-linear-to-"],[class*="before:bg-gradient-to-"],[class*="from-surface"],[class*="from-token-"]):not([data-ds-part="composer"],[data-ds-part="composer"] *,[data-codex-composer-root],[data-codex-composer-root] *,[role="dialog"],[role="dialog"] *,[role="menu"],[role="menu"] *,[data-slot="popover-content"],[data-slot="popover-content"] *,[data-local-conversation-final-assistant],[data-local-conversation-final-assistant] *,[data-user-message-bubble],[data-user-message-bubble] *)::before,
-        html[data-live-wallpaper="on"] :is([data-app-shell-main-surface],[data-app-shell-focus-area="main"]) :is(header,.app-header-tint,[class*="_Header_"],[data-app-shell-page-surface="true"],[data-app-shell-pane-frame],[data-app-shell-main-content-layout],[data-app-shell-main-content-top-fade],[data-app-shell-header-layout],[data-app-shell-header-edge-scroll],.sticky:not(:has([data-ds-part="composer"],[data-codex-composer-root])),[data-sticky]:not(:has([data-ds-part="composer"],[data-codex-composer-root])),[class*="after:bg-linear-to-"],[class*="after:bg-gradient-to-"],[class*="before:bg-linear-to-"],[class*="before:bg-gradient-to-"],[class*="from-surface"],[class*="from-token-"]):not([data-ds-part="composer"],[data-ds-part="composer"] *,[data-codex-composer-root],[data-codex-composer-root] *,[role="dialog"],[role="dialog"] *,[role="menu"],[role="menu"] *,[data-slot="popover-content"],[data-slot="popover-content"] *,[data-local-conversation-final-assistant],[data-local-conversation-final-assistant] *,[data-user-message-bubble],[data-user-message-bubble] *)::after{background:transparent!important;background-color:transparent!important;background-image:none!important;box-shadow:none!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
-        html[data-live-wallpaper="on"] [data-app-action-timeline-scroll] > [class~="pointer-events-none"][class~="absolute"]:has(:is(.composer-surface-chrome,[class*="_ComposerLayoutRoot_"],[data-composer-surface-variant],[data-ds-part="composer"])) > [class~="pointer-events-none"][class~="absolute"][class~="bg-surface"],
+        html[data-live-wallpaper="on"] :is([data-app-shell-main-surface],[data-app-shell-focus-area="main"]) :is(header,.app-header-tint,[class*="_Header_"],[data-app-shell-page-surface="true"],[data-app-shell-pane-frame],[data-app-shell-main-content-layout],[data-app-shell-main-content-top-fade],[data-app-shell-header-layout],[data-app-shell-header-edge-scroll],.sticky:not([data-ds-part="composer"],[data-codex-composer-root],[data-composer-surface-variant],.composer-surface-chrome),[data-sticky]:not([data-ds-part="composer"],[data-codex-composer-root],[data-composer-surface-variant],.composer-surface-chrome),[class*="after:bg-linear-to-"],[class*="after:bg-gradient-to-"],[class*="before:bg-linear-to-"],[class*="before:bg-gradient-to-"],[class*="from-surface"],[class*="from-token-"]):not([data-ds-part="composer"],[data-ds-part="composer"] *,[data-codex-composer-root],[data-codex-composer-root] *,[role="dialog"],[role="dialog"] *,[role="menu"],[role="menu"] *,[data-slot="popover-content"],[data-slot="popover-content"] *,[data-local-conversation-final-assistant],[data-local-conversation-final-assistant] *,[data-user-message-bubble],[data-user-message-bubble] *)::before,
+        html[data-live-wallpaper="on"] :is([data-app-shell-main-surface],[data-app-shell-focus-area="main"]) :is(header,.app-header-tint,[class*="_Header_"],[data-app-shell-page-surface="true"],[data-app-shell-pane-frame],[data-app-shell-main-content-layout],[data-app-shell-main-content-top-fade],[data-app-shell-header-layout],[data-app-shell-header-edge-scroll],.sticky:not([data-ds-part="composer"],[data-codex-composer-root],[data-composer-surface-variant],.composer-surface-chrome),[data-sticky]:not([data-ds-part="composer"],[data-codex-composer-root],[data-composer-surface-variant],.composer-surface-chrome),[class*="after:bg-linear-to-"],[class*="after:bg-gradient-to-"],[class*="before:bg-linear-to-"],[class*="before:bg-gradient-to-"],[class*="from-surface"],[class*="from-token-"]):not([data-ds-part="composer"],[data-ds-part="composer"] *,[data-codex-composer-root],[data-codex-composer-root] *,[role="dialog"],[role="dialog"] *,[role="menu"],[role="menu"] *,[data-slot="popover-content"],[data-slot="popover-content"] *,[data-local-conversation-final-assistant],[data-local-conversation-final-assistant] *,[data-user-message-bubble],[data-user-message-bubble] *)::after{background:transparent!important;background-color:transparent!important;background-image:none!important;box-shadow:none!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
+        html[data-live-wallpaper="on"] [data-app-action-timeline-scroll] > [class~="pointer-events-none"][class~="absolute"] > [class~="pointer-events-none"][class~="absolute"][class~="bg-surface"],
         html[data-live-wallpaper="on"] [data-thread-scroll-footer] > [aria-hidden="true"],
         html[data-live-wallpaper="on"] .thread-scroll-container .pointer-events-none.sticky > [aria-hidden="true"].pointer-events-none.absolute.bg-gradient-to-t.from-surface,
         html[data-live-wallpaper="on"] [data-composer-surface-variant][data-composer-utility-bar-variant="home"]:has([class*="ComposerLayoutBody"]){background:transparent!important;background-color:transparent!important;background-image:none!important}
@@ -499,6 +535,27 @@ codexPlus.extension((ctx) => {
       cancelAnimationFrame(raf);
       cancelAnimationFrame(topScanQueued);
       topScanQueued = 0;
+      clearTimeout(topScanTimer);
+      topScanTimer = 0;
+      clearTimeout(scanCooldownTimer);
+      scanCooldownTimer = 0;
+      taskPruneStop?.();
+      taskPruneStop = null;
+      composerTaskObserver?.disconnect();
+      composerTaskObserver = null;
+      observedComposerNode = null;
+      try { agentStatusUnsubscribe?.(); } catch {}
+      agentStatusUnsubscribe = null;
+      for (const off of taskUnsubscribers.splice(0)) {
+        try { off?.(); } catch {}
+      }
+      activeTaskTurns.clear();
+      domTaskRunning = false;
+      manualTaskPlayOverride = false;
+      cachedComposerRoots = [];
+      cachedSidebarRoot = null;
+      cachedOwnRailNodes = null;
+      cachedMainRoots = [];
       activeMedia?.pause?.();
       if (activeBlob) URL.revokeObjectURL(activeBlob);
       mediaBox.querySelectorAll('video').forEach(v => { v.pause(); v.removeAttribute('src'); v.load(); });
@@ -539,16 +596,6 @@ codexPlus.extension((ctx) => {
     for (const [node, record] of glassOverrides) restoreNodeGlass(node, record);
     glassOverrides.clear();
   }
-  function resolveComposerNodes() {
-    const raw = [...document.querySelectorAll('[data-composer-surface-variant],[class*="_ComposerLayoutRoot_"],.composer-surface-chrome,[data-ds-part="composer"]')];
-    const resolved = [];
-    for (const node of raw) {
-      const isHomeVariant = node.getAttribute?.('data-composer-utility-bar-variant') === 'home';
-      const target = isHomeVariant ? (node.querySelector?.('[class*="ComposerLayoutBody"]') || node) : node;
-      if (target && !resolved.includes(target)) resolved.push(target);
-    }
-    return resolved.filter((node) => !resolved.some((other) => other !== node && other.contains?.(node)));
-  }
   function resolvePanelStyle(zone) {
     const colorKeys = { 1: 'color1', 2: 'color2', 3: 'color3' };
     const colorDefaults = { 1: '#232323', 2: '#232323', 3: '#4a4a4a' };
@@ -563,38 +610,77 @@ codexPlus.extension((ctx) => {
     const userBg = `rgba(${userRgb[0]},${userRgb[1]},${userRgb[2]},${alphaText})`;
     return { opacityPct, blurPx, blurValue: blurPx > 0 ? `blur(${blurPx}px)` : 'none', alpha, bg, userBg };
   }
+  const GLASS_SCAN_SELECTOR = [
+    'aside[data-app-shell-left-panel-appearance]',
+    '[data-local-conversation-final-assistant="true"]',
+    '[data-user-message-bubble]',
+    '[data-composer-surface-variant]',
+    '[class*="_ComposerLayoutRoot_"]',
+    '.composer-surface-chrome',
+    '[data-ds-part="composer"]',
+    '[class*="_homeUtilityBar_"]',
+    '[class*="_ComposerHomeUtilityBar_"]',
+  ].join(',');
   function syncGlass() {
-    if (!settings.enabled) { restoreGlass(); return; }
+    if (!settings.enabled) { if (glassOverrides.size) restoreGlass(); return; }
     // Inline important overrides both cascade-layer utilities and theme rules; restore cleanly on disable/unload.
     const p1 = resolvePanelStyle(1);
     const p2 = resolvePanelStyle(2);
     const p3 = resolvePanelStyle(3);
-    const composerNodes = resolveComposerNodes();
-    const utilityNodes = [...document.querySelectorAll('[class*="_homeUtilityBar_"],[class*="_ComposerHomeUtilityBar_"]')]
-      .filter((node) => !composerNodes.some((composer) => composer === node || composer.contains?.(node)));
+    const matched = document.querySelectorAll(GLASS_SCAN_SELECTOR);
+    const composerRaw = [];
+    const utilityRaw = [];
+    const sidebars = [];
+    const assistants = [];
+    const users = [];
+    for (const node of matched) {
+      if (node.matches?.('aside[data-app-shell-left-panel-appearance]')) sidebars.push(node);
+      if (node.matches?.('[data-local-conversation-final-assistant="true"]')) assistants.push(node);
+      if (node.matches?.('[data-user-message-bubble]')) users.push(node);
+      if (node.matches?.('[data-composer-surface-variant],[class*="_ComposerLayoutRoot_"],.composer-surface-chrome,[data-ds-part="composer"]')) composerRaw.push(node);
+      if (node.matches?.('[class*="_homeUtilityBar_"],[class*="_ComposerHomeUtilityBar_"]')) utilityRaw.push(node);
+    }
+    const composerResolved = [];
+    for (const node of composerRaw) {
+      const isHomeVariant = node.getAttribute?.('data-composer-utility-bar-variant') === 'home';
+      const target = isHomeVariant ? (node.querySelector?.('[class*="ComposerLayoutBody"]') || node) : node;
+      if (target && !composerResolved.includes(target)) composerResolved.push(target);
+    }
+    const composerNodes = composerResolved.filter((node) => !composerResolved.some((other) => other !== node && other.contains?.(node)));
+    const utilityNodes = utilityRaw.filter((node) => !composerNodes.some((composer) => composer === node || composer.contains?.(node)));
     const targets = [];
+    const activeNodes = new Set();
     const pushGroup = (nodes, bg, blurValue) => {
       for (const node of nodes) {
-        if (node) targets.push([node, bg, blurValue]);
+        if (!node) continue;
+        targets.push([node, bg, blurValue]);
+        activeNodes.add(node);
       }
     };
-    pushGroup(document.querySelectorAll('aside[data-app-shell-left-panel-appearance]'), p1.bg, p1.blurValue);
-    pushGroup(document.querySelectorAll('[data-local-conversation-final-assistant="true"]'), p2.bg, p2.blurValue);
-    pushGroup(document.querySelectorAll('[data-user-message-bubble]'), p2.userBg, p2.blurValue);
+    pushGroup(sidebars, p1.bg, p1.blurValue);
+    pushGroup(assistants, p2.bg, p2.blurValue);
+    pushGroup(users, p2.userBg, p2.blurValue);
     pushGroup(composerNodes, p3.bg, p3.blurValue);
     pushGroup(utilityNodes, p3.bg, p3.blurValue);
-    const activeNodes = new Set(targets.map(([node]) => node));
-    for (const [node, record] of glassOverrides) {
-      if (!node.isConnected || !activeNodes.has(node)) {
-        restoreNodeGlass(node, record);
-        glassOverrides.delete(node);
+    if (glassOverrides.size) {
+      for (const [node, record] of glassOverrides) {
+        if (!node.isConnected || !activeNodes.has(node)) {
+          restoreNodeGlass(node, record);
+          glassOverrides.delete(node);
+        }
       }
     }
     for (const [node, bg, blurValue] of targets) {
-      if (!glassOverrides.has(node)) glassOverrides.set(node, {});
-      const record = glassOverrides.get(node);
+      let record = glassOverrides.get(node);
+      const sig = `${blurValue}|${bg}`;
+      if (record?.sig === sig) continue;
+      if (!record) {
+        record = {};
+        glassOverrides.set(node, record);
+      }
       applyGlassProp(node, record, 'backdrop-filter', blurValue);
       applyGlassProp(node, record, 'background-color', bg);
+      record.sig = sig;
     }
   }
   function clearTopAttrSet(set, attr) {
@@ -632,12 +718,25 @@ codexPlus.extension((ctx) => {
     const h = parseFloat(ps.height || '0');
     return ps.height === 'auto' || !Number.isFinite(h) || h <= 120 || String(ps.backgroundImage || '').includes('gradient');
   }
-  const TOP_CHROME_SKIP_SELECTOR = '#lws-drawer,[data-codex-plus-ext],[data-codex-plus-image-native],aside,[data-ds-part="composer"],[data-codex-composer-root],[data-composer-surface-variant],[class*="_ComposerLayoutRoot_"],.composer-surface-chrome,[class*="_homeUtilityBar_"],[class*="_ComposerHomeUtilityBar_"],[data-local-conversation-final-assistant],[data-user-message-bubble],[data-message-author-role],[data-ds-part="message"],[data-response-annotation-conversation],[class~="rounded-2xl"][class~="border"],[class~="rounded-xl"][class~="border"],[role="dialog"],[role="menu"],[role="listbox"],[role="tooltip"],[data-slot="popover-content"],[data-radix-popper-content-wrapper],[data-sonner-toast],button,a,input,textarea,select,svg,img,video,canvas,[role="button"],[contenteditable]';
+  const TOP_CHROME_SKIP_SELECTOR = '#lws-drawer,[data-codex-plus-ext],[data-codex-plus-image-native],aside,[data-ds-part="thread"],.thread-scroll-container,[data-testid="conversation-turn"],article,pre,code,table,blockquote,p,[data-ds-part="composer"],[data-codex-composer-root],[data-composer-surface-variant],[class*="_ComposerLayoutRoot_"],.composer-surface-chrome,[class*="_homeUtilityBar_"],[class*="_ComposerHomeUtilityBar_"],[data-local-conversation-final-assistant],[data-user-message-bubble],[data-message-author-role],[data-ds-part="message"],[data-response-annotation-conversation],[class~="rounded-2xl"][class~="border"],[class~="rounded-xl"][class~="border"],[role="dialog"],[role="menu"],[role="listbox"],[role="tooltip"],[data-slot="popover-content"],[data-radix-popper-content-wrapper],[data-sonner-toast],button,a,input,textarea,select,svg,img,video,canvas,[role="button"],[contenteditable]';
   function markTopAttr(set, attr, el) {
     if (!set.has(el)) {
       el.setAttribute(attr, 'true');
       set.add(el);
     }
+  }
+  function getMainRoots() {
+    const now = Date.now();
+    if (cachedMainRoots.length && now - cachedMainRootsAt < 1000 && cachedMainRoots.every(r => r.isConnected)) {
+      return cachedMainRoots;
+    }
+    const roots = [];
+    for (const r of document.querySelectorAll('main[data-app-shell-main-surface],[data-app-shell-focus-area="main"],[data-ds-part="main"],[data-app-shell-workspace-row] > :not(aside)')) {
+      if (r && !roots.includes(r)) roots.push(r);
+    }
+    cachedMainRoots = roots;
+    cachedMainRootsAt = now;
+    return roots;
   }
   function scanTopChrome() {
     if (!settings.enabled) { restoreTopChrome(); return; }
@@ -645,10 +744,8 @@ codexPlus.extension((ctx) => {
     for (const set of [topClearNodes, pseudoClearNodes, shadowClearNodes]) {
       for (const el of set) if (!el.isConnected) set.delete(el);
     }
-    const roots = [];
-    for (const r of document.querySelectorAll('main[data-app-shell-main-surface],[data-app-shell-focus-area="main"],[data-ds-part="main"],[data-app-shell-workspace-row] > :not(aside)')) {
-      if (r && !roots.includes(r)) roots.push(r);
-    }
+    const roots = getMainRoots();
+    if (roots.length) lastTopScanAt = Date.now();
     const inspectNode = (el, rootRect) => {
       if (!el || el.nodeType !== 1 || el.matches?.(TOP_CHROME_SKIP_SELECTOR)) return false;
       const rect = el.getBoundingClientRect?.();
@@ -674,37 +771,52 @@ codexPlus.extension((ctx) => {
       if (paneRoot.matches?.(TOP_CHROME_SKIP_SELECTOR)) continue;
       const rootRect = paneRoot.getBoundingClientRect?.();
       if (!rootRect || rootRect.width < 120 || rootRect.height < 80) continue;
-      const walk = (el) => {
-        if (!inspectNode(el, rootRect)) return;
-        for (const child of el.children || []) walk(child);
+      const walk = (el, depth) => {
+        if (depth > 6 || !inspectNode(el, rootRect)) return;
+        for (const child of el.children || []) walk(child, depth + 1);
       };
-      walk(paneRoot);
+      walk(paneRoot, 0);
     }
   }
   function scheduleTopChromeScan() {
-    if (disposed || !settings.enabled || topScanQueued) return;
-    topScanQueued = requestAnimationFrame(() => {
-      topScanQueued = 0;
-      if (!disposed && settings.enabled) scanTopChrome();
-    });
+    if (disposed || !settings.enabled || topScanQueued || topScanTimer) return;
+    const queueFrame = () => {
+      if (disposed || !settings.enabled || topScanQueued) return;
+      topScanQueued = requestAnimationFrame(() => {
+        topScanQueued = 0;
+        if (!disposed && settings.enabled) scanTopChrome();
+      });
+    };
+    const elapsed = Date.now() - lastTopScanAt;
+    if (elapsed >= 350) queueFrame();
+    else topScanTimer = setTimeout(() => { topScanTimer = 0; queueFrame(); }, 350 - elapsed);
   }
   function clearSurface(e) { if (!e || e === document.body || e === document.documentElement || marked.has(e)) return; e.setAttribute('data-lws-clear', 'true'); marked.add(e); }
+  const SURFACE_CLEAR_SELECTOR = '[data-ds-part="main"],[data-ds-part="thread"],[data-app-shell-main-surface],[data-app-shell-page-surface="true"],[data-app-shell-header-layout],[data-app-shell-header-edge-scroll],[data-app-shell-left-panel-appearance],[data-codex-composer-root],[data-composer-surface-variant],[class*="_ComposerLayoutRoot_"],.composer-surface-chrome,[data-ds-part="composer"]';
   function scanSurfaces() {
-    for (const selector of ['[data-ds-part="main"]', '[data-ds-part="thread"]', '[data-app-shell-main-surface]', '[data-app-shell-page-surface="true"]', '[data-app-shell-header-layout]', '[data-app-shell-header-edge-scroll]', '[data-app-shell-left-panel-appearance]']) {
-      const el = document.querySelector(selector); let e = selector.includes('left-panel') ? el?.parentElement : el;
+    for (const node of document.querySelectorAll(SURFACE_CLEAR_SELECTOR)) {
+      let start = node;
+      if (node.matches?.('[data-app-shell-left-panel-appearance]')) {
+        start = node.parentElement;
+      } else if (node.matches?.('[data-codex-composer-root],[data-composer-surface-variant],[class*="_ComposerLayoutRoot_"],.composer-surface-chrome,[data-ds-part="composer"]')) {
+        const outerComposer = node.closest?.('[data-codex-composer-root]') || node;
+        start = outerComposer?.parentElement;
+      }
+      let e = start;
       while (e && e !== document.body && e !== document.documentElement) { clearSurface(e); e = e.parentElement; }
     }
-    // The native composer keeps its own glass; only ancestors outside the outermost composer root are cleared.
-    for (const composerNode of document.querySelectorAll('[data-codex-composer-root],[data-composer-surface-variant],[class*="_ComposerLayoutRoot_"],.composer-surface-chrome,[data-ds-part="composer"]')) {
-      const outerComposer = composerNode?.closest?.('[data-codex-composer-root]') || composerNode;
-      let e = outerComposer?.parentElement;
-      while (e && e !== document.body && e !== document.documentElement) { clearSurface(e); e = e.parentElement; }
-    }
-    scanTopChrome();
+    if (!lastTopScanAt || Date.now() - lastTopScanAt >= 350) scanTopChrome();
   }
-  ctx.onScan(() => {
-    scanSurfaces();
-    syncGlass();
+  function runFullScan() {
+    lastScanAt = Date.now();
+    if (!settings.enabled) {
+      if (glassOverrides.size) restoreGlass();
+      if (topClearNodes.size || pseudoClearNodes.size || shadowClearNodes.size) restoreTopChrome();
+    } else {
+      cachedComposerRootsAt = 0;
+      scanSurfaces();
+      syncGlass();
+    }
     if (drawerOpen) {
       if (document.querySelector('.codex-plus-page-overlay') || document.documentElement.hasAttribute('data-codex-plus-side-panel-open')) {
         closeDrawer();
@@ -714,6 +826,23 @@ codexPlus.extension((ctx) => {
       }
     } else {
       syncOwnRailActive(false);
+    }
+  }
+  ctx.onScan(() => {
+    cachedComposerRootsAt = 0;
+    syncDomTaskState();
+    const now = Date.now();
+    if (!lastScanAt || now - lastScanAt >= 180) {
+      clearTimeout(scanCooldownTimer);
+      scanCooldownTimer = 0;
+      runFullScan();
+      return;
+    }
+    if (!scanCooldownTimer) {
+      scanCooldownTimer = setTimeout(() => {
+        scanCooldownTimer = 0;
+        if (!disposed) runFullScan();
+      }, 180);
     }
   });
   scanSurfaces(); syncGlass();
@@ -733,6 +862,7 @@ codexPlus.extension((ctx) => {
     root.style.setProperty('--lws-glass-blur-3', p3.blurPx + 'px');
     root.style.setProperty('--lws-fit', ['cover', 'contain', 'fill'].includes(settings.fit) ? settings.fit : 'cover');
     syncGlass();
+    lastTopScanAt = 0;
     if (settings.enabled) scanTopChrome();
     else restoreTopChrome();
     root.style.setProperty('--lws-x', clamp(settings.focalX, 0, 100) + '%');
@@ -769,12 +899,202 @@ codexPlus.extension((ctx) => {
     const revision = ++playbackRevision, target = activeMedia;
     cancelAnimationFrame(raf); raf = 0;
     if (activeMedia?.tagName === 'VIDEO') {
-      if (shouldPause()) { activeMedia.pause(); stateLine(reduced() ? '已按系统“减少动态效果”暂停' : settings.enabled ? '已暂停' : '壁纸已关闭'); }
+      if (shouldPause()) { activeMedia.pause(); stateLine(pausedStatusText()); }
       else { activeMedia.play().then(() => { if (!disposed && revision === playbackRevision && activeMedia === target && !shouldPause()) stateLine('静音循环播放'); }).catch(() => { if (!disposed && revision === playbackRevision && !shouldPause()) stateLine('播放被阻止，请点击“播放”重试', true); }); }
     } else if (activeMedia) stateLine(settings.enabled ? '图片壁纸' : '壁纸已关闭');
-    else if (settings.enabled) { stateLine(shouldPause() ? reduced() ? '已按系统“减少动态效果”暂停' : '已暂停' : '内置动态场景 · 低负载'); drawScene(0); if (!shouldPause()) { lastFrame = performance.now(); raf = requestAnimationFrame(tick); } }
+    else if (settings.enabled) { stateLine(shouldPause() ? pausedStatusText() : '内置动态场景 · 低负载'); drawScene(0); if (!shouldPause()) { lastFrame = performance.now(); raf = requestAnimationFrame(tick); } }
     else stateLine('壁纸已关闭');
   }
+  function getComposerRoots() {
+    const now = Date.now();
+    if (cachedComposerRoots.length && now - cachedComposerRootsAt < 2000 && cachedComposerRoots.every(n => n.isConnected)) {
+      return cachedComposerRoots;
+    }
+    cachedComposerRoots = [...document.querySelectorAll(COMPOSER_ROOT_SELECTOR)];
+    cachedComposerRootsAt = now;
+    return cachedComposerRoots;
+  }
+
+  function isTaskStopOrQueueButton(btn) {
+    if (!btn || btn.hasAttribute?.('data-codex-plus-ext') || btn.closest?.('[data-codex-plus-ext]')) return false;
+    if (btn.disabled || btn.getAttribute?.('aria-disabled') === 'true') return false;
+    const testId = String(btn.getAttribute?.('data-testid') || btn.dataset?.testid || '');
+    const action = String(btn.getAttribute?.('data-action') || btn.dataset?.action || '');
+    if (/stop/i.test(testId) || action === 'stop') return true;
+    const label = `${btn.getAttribute?.('aria-label') || ''} ${btn.getAttribute?.('title') || ''}`.trim();
+    if (label) {
+      if (TASK_IGNORE_LABEL_RE.test(label)) return false;
+      if (TASK_BUTTON_LABEL_RE.test(label)) return true;
+      if (/发送|send|submit/i.test(label)) return false;
+    }
+    if (btn.matches?.('button.bg-composer-primary,button.size-token-button-composer')) {
+      const rects = btn.querySelectorAll?.('rect') || [];
+      const others = btn.querySelectorAll?.('path,circle,line,polygon,polyline') || [];
+      if (rects.length === 1 && others.length === 0) return true;
+    }
+    return false;
+  }
+
+  function detectDomTaskRunning() {
+    for (const cRoot of getComposerRoots()) {
+      for (const btn of cRoot.querySelectorAll?.('button') || []) {
+        if (isTaskStopOrQueueButton(btn)) return true;
+      }
+    }
+    if (!cachedSidebarRoot?.isConnected) {
+      cachedSidebarRoot = document.querySelector('aside[data-app-shell-left-panel-appearance]');
+    }
+    if (cachedSidebarRoot) {
+      for (const spin of cachedSidebarRoot.querySelectorAll?.(SIDEBAR_SPINNER_SELECTOR) || []) {
+        if (spin.closest?.('[data-codex-plus-ext]')) continue;
+        if (spin.closest?.('[data-app-action-sidebar-thread-id]')) return true;
+      }
+    }
+    return false;
+  }
+
+  function bindComposerTaskObserver() {
+    if (disposed || typeof MutationObserver !== 'function') return;
+    const target = getComposerRoots()[0] || null;
+    if (!target || target === observedComposerNode) return;
+    composerTaskObserver?.disconnect();
+    observedComposerNode = target;
+    composerTaskObserver = new MutationObserver(() => {
+      if (!disposed && settings.pauseOnTask && settings.enabled) syncDomTaskState();
+    });
+    composerTaskObserver.observe(target, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['aria-label', 'title', 'data-testid', 'disabled', 'aria-disabled'],
+    });
+  }
+
+  function syncDomTaskState() {
+    if (disposed) return false;
+    if (!settings.pauseOnTask || !settings.enabled) {
+      if (domTaskRunning) {
+        const wasPaused = shouldPause();
+        domTaskRunning = false;
+        manualTaskPlayOverride = false;
+        if (shouldPause() !== wasPaused) syncPlayback();
+      }
+      return false;
+    }
+    bindComposerTaskObserver();
+    const nextDom = detectDomTaskRunning();
+    if (nextDom === domTaskRunning) return false;
+    const wasPaused = shouldPause();
+    domTaskRunning = nextDom;
+    manualTaskPlayOverride = false;
+    if (!nextDom) activeTaskTurns.clear();
+    if (shouldPause() !== wasPaused) syncPlayback();
+    return true;
+  }
+
+  function extractTaskTurnKey(payload) {
+    const data = payload?.params || payload?.data || payload?.payload || payload;
+    if (!data || typeof data !== 'object') return '__active_turn__';
+    const host = data.hostId ?? data.host_id;
+    if (typeof host === 'string' && host && host !== 'local') return '';
+    const threadId = String(
+      data.sessionId || data.session_id || data.threadId || data.thread_id
+      || data.conversationId || data.conversation_id
+      || data.turn?.threadId || data.turn?.thread_id || ''
+    ).trim();
+    const turnId = String(data.turnId || data.turn_id || data.turn?.id || '').trim();
+    return threadId || turnId || '__active_turn__';
+  }
+  function handleTaskActivity(active, payload) {
+    if (disposed) return;
+    const key = extractTaskTurnKey(payload);
+    if (!key) return;
+    const wasPaused = shouldPause();
+    const wasActive = hasActiveTask();
+    pruneStaleTaskTurns();
+    if (active) {
+      const now = Date.now();
+      const prev = activeTaskTurns.get(key);
+      if (prev && now - prev < 5000) return;
+      if (!wasActive) manualTaskPlayOverride = false;
+      activeTaskTurns.set(key, now);
+    } else if (key === '__active_turn__') {
+      activeTaskTurns.clear();
+      if (!domTaskRunning) manualTaskPlayOverride = false;
+    } else {
+      activeTaskTurns.delete(key);
+      activeTaskTurns.delete('__active_turn__');
+      if (!hasActiveTask()) manualTaskPlayOverride = false;
+    }
+    if (shouldPause() !== wasPaused) syncPlayback();
+  }
+  function observeNativeTaskEnvelope(value, depth = 0) {
+    if (!value || typeof value !== 'object' || depth > 4) return;
+    const host = value.hostId ?? value.host_id;
+    if (typeof host === 'string' && host && host !== 'local') return;
+    const method = String(value.method || value.type || '');
+    if (method === 'turn/started' || method === 'item/started' || method === 'item/agentMessage/delta') {
+      handleTaskActivity(true, value.params || value);
+    } else if (method === 'turn/completed' || method === 'turn/aborted' || method === 'error') {
+      handleTaskActivity(false, value.params || value);
+    }
+    for (const key of ['message', 'request', 'payload', 'data', 'notification']) {
+      if (value[key] && typeof value[key] === 'object') observeNativeTaskEnvelope(value[key], depth + 1);
+    }
+  }
+  function syncAgentStatusSubscription() {
+    if (disposed) return;
+    const want = !!(settings.pauseOnTask && settings.enabled);
+    if (want && !agentStatusUnsubscribe && typeof ctx.on === 'function') {
+      agentStatusUnsubscribe = ctx.on('agent/status', (payload) => {
+        const status = String(payload?.status || '').toLowerCase();
+        if (status === 'running') handleTaskActivity(true, payload);
+        else if (status === 'idle' || status === 'aborted' || status === 'completed' || status === 'failed' || status === 'error') {
+          handleTaskActivity(false, payload);
+        }
+      });
+    } else if (!want && agentStatusUnsubscribe) {
+      try { agentStatusUnsubscribe(); } catch {}
+      agentStatusUnsubscribe = null;
+    }
+  }
+  if (typeof ctx.on === 'function') {
+    for (const evt of ['codex/turn/started', 'codex/item/started', 'codex/item/agentMessage/delta']) {
+      const off = ctx.on(evt, (payload) => handleTaskActivity(true, payload));
+      if (typeof off === 'function') taskUnsubscribers.push(off);
+    }
+    for (const evt of ['codex/turn/completed', 'codex/error']) {
+      const off = ctx.on(evt, (payload) => handleTaskActivity(false, payload));
+      if (typeof off === 'function') taskUnsubscribers.push(off);
+    }
+  }
+  syncAgentStatusSubscription();
+  ctx.listen(window, 'message', (event) => {
+    const origin = String(event?.origin || '');
+    const nativeLocal = event?.source == null && !origin
+      && event?.data?.type === 'mcp-notification' && event.data.hostId === 'local';
+    if (!nativeLocal && event?.source !== window) return;
+    if (origin && origin !== 'null' && origin !== window.location.origin) return;
+    observeNativeTaskEnvelope(event?.data);
+  }, true);
+  ctx.listen(window, 'codex-message-from-view', (event) => {
+    const detail = event?.detail;
+    const method = String(detail?.method || detail?.type || '');
+    if (method === 'interrupt-conversation' || method === 'turn_aborted' || method === 'turn/completed') {
+      handleTaskActivity(false, detail);
+    }
+  }, true);
+  let taskPollTicks = 0;
+  taskPruneStop = ctx.setInterval(() => {
+    if (disposed) return;
+    if (settings.pauseOnTask && settings.enabled && !document.hidden) syncDomTaskState();
+    taskPollTicks += 1;
+    if (taskPollTicks % 15 === 0 && activeTaskTurns.size && pruneStaleTaskTurns()) {
+      if (!hasActiveTask()) manualTaskPlayOverride = false;
+      syncPlayback();
+    }
+  }, 800);
+  syncDomTaskState();
   ctx.listen(window, 'resize', resize); ctx.listen(document, 'scroll', scheduleTopChromeScan, true); ctx.listen(document, 'visibilitychange', syncPlayback); ctx.listen(motionQuery, 'change', syncPlayback); resize();
   function acceptMotion() { settings.motionConsent = true; settings.paused = false; storeSettings(); }
   async function localBlobUrl(localId, version) {
@@ -993,7 +1313,18 @@ codexPlus.extension((ctx) => {
     status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite');
     const playbackControls = $('div', 'lws-controls');
     const play = button('暂停', null, 'lws-small'); play.dataset.action = 'playback';
-    play.onclick = () => { const wasPaused = shouldPause(); acceptMotion(); settings.paused = !wasPaused; saveSettings(); };
+    play.onclick = () => {
+      const wasPaused = shouldPause();
+      acceptMotion();
+      if (wasPaused && isTaskPaused()) {
+        manualTaskPlayOverride = true;
+        activeTaskTurns.clear();
+      } else if (!wasPaused && hasActiveTask()) {
+        manualTaskPlayOverride = false;
+      }
+      settings.paused = !wasPaused;
+      saveSettings();
+    };
     const random = button('随机一张', () => randomWallpaper(tab === 'gallery' ? resultItems : tab === 'favorites' ? favorites : builtins), 'lws-small');
     const off = button('关闭壁纸', () => { settings.enabled = !settings.enabled; saveSettings(); }, 'lws-small');
     const retryCurrent = button('重试', () => current && choose(current), 'lws-small');
